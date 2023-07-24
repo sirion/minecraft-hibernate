@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+const DEFAULT_PROTOCOL_VERSION = "1.20.1"
+
 type ActivePlayers struct {
 	Number int
 	Names  []string
@@ -36,13 +38,14 @@ func NewCommander() *Commander {
 		commands:         make([]string, 0, 100),
 		buffer:           make([]byte, 0, 10*1024),
 		cActivePlayers:   make(chan ActivePlayers, 1),
-		cServerPort:      make(chan int, 1),
+		cServerPort:      nil,
 		version:          "1.19.4",
 	}
 }
 
 func (c *Commander) ServerPort() int {
 	if c.serverPort == 0 {
+		c.cServerPort = make(chan int, 1)
 		c.serverPort = <-c.cServerPort
 	}
 	return c.serverPort
@@ -105,7 +108,12 @@ func (c *Commander) parseMessage(msg []byte) {
 			return
 		}
 
-		c.cServerPort <- int(port)
+		if c.cServerPort != nil {
+			c.cServerPort <- int(port)
+		} else {
+			c.serverPort = int(port)
+		}
+
 	}
 
 	// [18:38:34] [Server thread/INFO]: Starting minecraft server version 1.19.4

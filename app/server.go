@@ -47,137 +47,6 @@ const (
 	PROC_STAT_ERROR
 )
 
-type Server struct {
-	Active            bool
-	Process           *exec.Cmd
-	ProcessStatus     ProcessStatus
-	Commander         *Commander
-	Version           string
-	ProtocolVersion   int
-	IdleSince         time.Time
-	config            serverConfig
-	activeConnections int
-}
-
-type serverConfig struct {
-	StartOnPing   bool   `json:"startOnPing"`
-	Port          int    `json:"port"`
-	IdleTimeout   int    `json:"idleTimeout"`
-	CheckInterval int    `json:"checkInterval"`
-	WorkingDir    string `json:"workingDir"`
-	JarPath       string `json:"jarPath"`
-	Favicon       string `json:"favicon"`
-	MemoryMin     string `json:"memoryMin"`
-	MemoryMax     string `json:"memoryMax"`
-}
-
-func (srv *Server) Listen() {
-	srv.Commander = NewCommander()
-
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", srv.config.Port))
-	if err != nil {
-		panic(err)
-	}
-
-	done := make(chan bool)
-
-	go srv.check()
-
-	go func() {
-		for srv.Active {
-			conn, err := listener.Accept()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "[ERROR] %s\n", err.Error())
-				return
-			}
-
-			var pkg *mc.Package
-
-			if srv.ProcessStatus != PROC_STAT_RUNNING {
-				connReader := bufio.NewReader(conn)
-				pkg = readPackage(connReader)
-				hs, err := pkg.Handshake()
-				if err != nil {
-					// No Handshake
-					fmt.Fprintf(os.Stderr, "Wrong handshake from client. PKG: %#v", pkg)
-					conn.Close()
-					continue
-				}
-
-				// hs.ServerAddress and hs.ServerPort could be used for routing in the future
-
-				// TODO: This should be taken from the server when started and then saved for next time
-				srv.ProtocolVersion = hs.ProtocolVersion
-				srv.Version = "1.19.4"
-
-				if hs.NextState == 1 {
-					// Requests Status
-					go srv.answerSleeping(connReader, conn)
-					if !srv.config.StartOnPing {
-						continue
-					} else {
-						pkg = nil // Don send handshake to started server
-					}
-				} else if hs.NextState != 2 {
-					fmt.Fprintf(os.Stderr, "Wrong state from client: %d --> PKG: %#v", hs.NextState, pkg)
-					conn.Close()
-					continue
-				}
-
-			}
-
-			if srv.ProcessStatus == PROC_STAT_STOPPING {
-				srv.Process.Wait()
-				srv.Process = nil
-				srv.ProcessStatus = PROC_STAT_STOPPED
-			}
-
-			if srv.ProcessStatus == PROC_STAT_STOPPED {
-				srv.start()
-			}
-
-			// if srv.ProcessStatus == PROC_STAT_STARTING {
-			// 	// TODO: Wait for server to listen
-			// 	time.Sleep(1 * time.Second)
-			// }
-
-			if srv.ProcessStatus == PROC_STAT_ERROR {
-				fmt.Fprintf(os.Stderr, "Server process error: %#v", srv.Process.ProcessState.ExitCode())
-				panic("PROC ERROR")
-			}
-
-			go func() {
-				serverconn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", srv.Commander.ServerPort()))
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "[ERROR] %s\n", err.Error())
-					conn.Close()
-					return
-				}
-
-				srv.WaitUntilStarted()
-				if pkg != nil {
-					pkg.WriteTo(serverconn)
-				}
-
-				srv.activeConnections += 1
-				go io.Copy(conn, serverconn)
-				io.Copy(serverconn, conn)
-				srv.activeConnections -= 1
-				conn.Close()
-
-			}()
-		}
-
-		srv.Commander.Stop()
-		srv.Process.Wait()
-		done <- true
-	}()
-
-	//<-time.After(300 * time.Second)
-	//srv.Active = false
-	<-done
-}
-
 func ServerFromConfig(path string) (*Server, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -209,14 +78,254 @@ func ServerFromConfig(path string) (*Server, error) {
 		conf.JarPath = "minecraft-server.jar"
 	}
 
+	commander := NewCommander()
+
 	srv := &Server{
-		Active:    true,
-		Process:   nil,
-		IdleSince: time.Now().Add(time.Hour),
-		config:    conf,
+		Active:          true,
+		Process:         nil,
+		IdleSince:       time.Now().Add(time.Hour),
+		Commander:       commander,
+		config:          conf,
+		protocolVersion: commander.version,
 	}
 
 	return srv, nil
+}
+
+type Server struct {
+	Active          bool
+	Process         *exec.Cmd
+	ProcessStatus   ProcessStatus
+	Commander       *Commander
+	Version         string
+	ProtocolVersion int
+	IdleSince       time.Time
+
+	protocolVersion   string
+	config            serverConfig
+	activeConnections int
+}
+
+type serverConfig struct {
+	Proxy         bool   `json:"proxy"`
+	StartOnPing   bool   `json:"startOnPing"`
+	Port          int    `json:"port"`
+	IdleTimeout   int    `json:"idleTimeout"`
+	CheckInterval int    `json:"checkInterval"`
+	WorkingDir    string `json:"workingDir"`
+	JarPath       string `json:"jarPath"`
+	Favicon       string `json:"favicon"`
+	MemoryMin     string `json:"memoryMin"`
+	MemoryMax     string `json:"memoryMax"`
+}
+
+func (srv *Server) Listen() {
+	done := make(chan bool)
+
+	srv.determineVersion()
+
+	go srv.check()
+
+	if srv.config.Proxy {
+		go srv.runProxy(done)
+	} else {
+		go srv.runPlaceholder(done)
+	}
+
+	//<-time.After(300 * time.Second)
+	//srv.Active = false
+	<-done
+}
+
+func (srv *Server) determineVersion() {
+	srv.start()
+	for {
+		if srv.ProcessStatus == PROC_STAT_RUNNING {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	srv.protocolVersion = srv.Commander.version
+}
+
+func (srv *Server) runProxy(done chan bool) {
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", srv.config.Port))
+	if err != nil {
+		panic(err)
+	}
+
+	for srv.Active {
+		conn, err := listener.Accept()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[ERROR] %s\n", err.Error())
+			return
+		}
+
+		var pkg *mc.Package
+
+		if srv.ProcessStatus != PROC_STAT_RUNNING {
+			connReader := bufio.NewReader(conn)
+			pkg = readPackage(connReader)
+			hs, err := pkg.Handshake()
+			if err != nil {
+				// No Handshake
+				fmt.Fprintf(os.Stderr, "Wrong handshake from client. PKG: %#v", pkg)
+				conn.Close()
+				continue
+			}
+
+			// hs.ServerAddress and hs.ServerPort could be used for routing in the future
+
+			// TODO: This should be taken from the server when started and then saved for next time
+			srv.ProtocolVersion = hs.ProtocolVersion
+
+			if hs.NextState == 1 {
+				// Requests Status
+				go srv.answerSleeping(connReader, conn)
+				if !srv.config.StartOnPing {
+					continue
+				} else {
+					pkg = nil // Do not send handshake to started server
+				}
+			} else if hs.NextState != 2 {
+				fmt.Fprintf(os.Stderr, "Wrong state from client: %d --> PKG: %#v", hs.NextState, pkg)
+				conn.Close()
+				continue
+			}
+
+		}
+
+		if srv.ProcessStatus == PROC_STAT_STOPPING {
+			srv.Process.Wait()
+			srv.Process = nil
+			srv.ProcessStatus = PROC_STAT_STOPPED
+		}
+
+		if srv.ProcessStatus == PROC_STAT_STOPPED {
+			srv.start()
+		}
+
+		// if srv.ProcessStatus == PROC_STAT_STARTING {
+		// 	// TODO: Wait for server to listen
+		// 	time.Sleep(1 * time.Second)
+		// }
+
+		if srv.ProcessStatus == PROC_STAT_ERROR {
+			fmt.Fprintf(os.Stderr, "Server process error: %#v", srv.Process.ProcessState.ExitCode())
+			panic("PROC ERROR")
+		}
+
+		go func() {
+			serverconn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", srv.Commander.ServerPort()))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[ERROR] %s\n", err.Error())
+				conn.Close()
+				return
+			}
+
+			srv.WaitUntilStarted()
+			if pkg != nil {
+				pkg.WriteTo(serverconn)
+			}
+
+			srv.activeConnections += 1
+			go io.Copy(conn, serverconn)
+			io.Copy(serverconn, conn)
+			srv.activeConnections -= 1
+			conn.Close()
+		}()
+	}
+
+	srv.Commander.Stop()
+	srv.Process.Wait()
+	done <- true
+}
+
+func (srv *Server) runPlaceholder(done chan bool) {
+	for srv.Active {
+		if srv.ProcessStatus == PROC_STAT_STOPPING {
+			srv.Process.Wait()
+			srv.Process = nil
+			srv.ProcessStatus = PROC_STAT_STOPPED
+		}
+
+		if srv.ProcessStatus == PROC_STAT_STARTING {
+			// Starting the minecraft server nothing to do
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		if srv.ProcessStatus == PROC_STAT_ERROR {
+			fmt.Fprintf(os.Stderr, "Server process error: %#v", srv.Process.ProcessState.ExitCode())
+			panic("PROC ERROR")
+		}
+
+		if srv.ProcessStatus == PROC_STAT_RUNNING {
+			// Minecraft server is running
+			// TODO: check if users are active
+
+			time.Sleep(1 * time.Second)
+			continue
+
+		}
+
+		if srv.ProcessStatus == PROC_STAT_STOPPED {
+			listener, err := net.Listen("tcp", fmt.Sprintf(":%d", srv.config.Port))
+			if err != nil {
+				panic(err)
+			}
+
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "[ERROR] %s\n", err.Error())
+					return
+				}
+
+				connReader := bufio.NewReader(conn)
+				pkg := readPackage(connReader)
+				hs, err := pkg.Handshake()
+				if err != nil {
+					// No Handshake
+					fmt.Fprintf(os.Stderr, "Wrong handshake from client. PKG: %#v", pkg)
+					conn.Close()
+					continue
+				}
+
+				// hs.ServerAddress and hs.ServerPort could be used for routing in the future
+
+				// TODO: This should be taken from the server when started and then saved for next time
+				srv.ProtocolVersion = hs.ProtocolVersion
+
+				if hs.NextState == 1 {
+					// Requests Status
+					go srv.answerSleeping(connReader, conn)
+					if srv.config.StartOnPing {
+						srv.start()
+						break
+					}
+				} else if hs.NextState == 2 {
+					// Connect
+					srv.start()
+					break
+				} else {
+					fmt.Fprintf(os.Stderr, "Wrong state from client: %d --> PKG: %#v", hs.NextState, pkg)
+					conn.Close()
+					continue
+				}
+			}
+			listener.Close()
+			err = srv.Process.Wait()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[ERROR] %s\n", err.Error())
+				return
+			}
+		}
+		time.Sleep(1 * time.Second)
+
+	}
+
+	done <- true
 }
 
 /// check runs in the background
@@ -242,9 +351,6 @@ func (srv *Server) check() {
 				// Shutdown server
 				srv.Commander.Stop()
 				srv.ProcessStatus = PROC_STAT_STOPPING
-				srv.Process.Wait()
-				srv.Process = nil
-				srv.ProcessStatus = PROC_STAT_STOPPED
 				srv.IdleSince = time.Now().Add(99999 * time.Hour)
 
 			} else if srv.IdleSince.After(time.Now()) {
@@ -327,9 +433,9 @@ func (srv *Server) answerPong(w io.Writer, pkg *mc.Package) {
 
 func (srv *Server) answerStatus(w io.Writer) {
 
-	description := "Server is sleeping. Connect to start. Retry after 10s if connection fails."
+	description := "Server is sleeping. Connect to start. Retry after 15s."
 	if srv.config.StartOnPing {
-		description = "Server is starting. Please wait and refresh."
+		description = "Server is starting. Please wait 15s and refresh."
 	}
 
 	favicon := DEFAULT_FAVICON
